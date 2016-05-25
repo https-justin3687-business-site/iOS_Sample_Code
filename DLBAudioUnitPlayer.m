@@ -1,0 +1,473 @@
+#import "DLBAudioUnitPlayer.h"
+#import <libkern/OSAtomic.h>
+#import <AVFoundation/AVFoundation.h>
+
+@implementation DLBAudioUnitPlayer
+
+//Declared as AURenderCallback in AudioUnit/AUComponent.h. See Audio Unit Component Services Reference.
+static OSStatus playbackCallback (
+                                  void                        *inRefCon,
+                                  AudioUnitRenderActionFlags  *ioActionFlags,
+                                  const AudioTimeStamp        *inTimeStamp,
+                                  UInt32                      inBusNumber,
+                                  UInt32                      inNumberFrames,
+                                  AudioBufferList             *ioData
+                                  ) {
+    
+    stAudioUnitSampleData *audioSampleData = (stAudioUnitSampleData *)inRefCon;
+    
+    if (audioSampleData->mFreeBuffers == audioSampleData->mBufferCount )
+        return noErr;
+    if (audioSampleData->mPlayedFrames >= audioSampleData->mConvertedFileFrames)
+        return noErr;
+    
+		
+    audioSampleData->mCallbackFrames = inNumberFrames;
+	
+    // Screen sleeps (sleep/wake crash), buffer changes from 1024 to 4096
+    if ( 4096 == inNumberFrames) {
+        
+        if (audioSampleData->mFramesPerBuffer < (audioSampleData->mFramesReaded + inNumberFrames)) {
+            
+            UInt32 frameOffset = audioSampleData->mFramesPerBuffer - audioSampleData->mFramesReaded;
+            
+            for (UInt32 i = 0; i < frameOffset; ++i) {
+                
+                for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
+                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+                }
+               
+                
+                ++audioSampleData->mFramesReaded;
+            }
+            
+            // move to next buffer
+            if (++audioSampleData->mCurrentBufferIdx == audioSampleData->mBufferCount)
+                audioSampleData->mCurrentBufferIdx = 0;
+            
+            // request one more buffer
+            OSAtomicAdd32(1,&audioSampleData->mFreeBuffers);
+            
+            UInt32 continueSampleNumber = 0;
+            for (UInt32 i = frameOffset; i < inNumberFrames; ++i) {
+                
+                for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
+                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][continueSampleNumber];
+                }
+                
+                ++continueSampleNumber;
+            }
+            
+            audioSampleData->mFramesReaded = continueSampleNumber;
+            
+            return noErr;
+        }
+        else {
+            
+            for (UInt32 i = 0; i < inNumberFrames; ++i) {
+                
+                for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
+                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+                }
+ 
+                ++audioSampleData->mFramesReaded;
+            }
+        }
+        audioSampleData->mPlayedFrames += 4096;
+    } //4096
+    else {
+        
+        for (UInt32 i = 0; i < audioSampleData->mCallbackFrames; ++i) {
+            
+            for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
+                ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+            }
+            
+            ++audioSampleData->mFramesReaded;
+        }
+        audioSampleData->mPlayedFrames += audioSampleData->mCallbackFrames;
+    }
+    
+    // the current buffer is used up
+    if (audioSampleData->mFramesReaded == audioSampleData->mFramesPerBuffer) {
+        
+        if (++audioSampleData->mCurrentBufferIdx == audioSampleData->mBufferCount)
+            audioSampleData->mCurrentBufferIdx = 0;
+        
+        OSAtomicAdd32(1,&audioSampleData->mFreeBuffers);
+        audioSampleData->mFramesReaded = 0;
+    }
+    
+    return noErr;
+}
+
+OSStatus checkStatus(OSStatus err, const char * msg)
+{
+    if (noErr == err)
+        return noErr;
+    
+    char errStr[30]={0};
+    
+    *(UInt32 *)(errStr + 1) = CFSwapInt32HostToBig(err);
+    
+    if (isprint(errStr[1]) && isprint(errStr[2]) && isprint(errStr[3]) && isprint(errStr[4])) {
+        errStr[0]=errStr[5]='\'';
+        errStr[6]='\0';
+    }
+    else {
+        sprintf(errStr,"%d",(int)err);
+    }
+    
+    NSLog(@"*** Error *** %s, (%s) \n", msg, errStr);
+    
+    return err;
+}
+
+-(void)cycleFillBufferFromFile{
+    
+    // a buffer is free
+    if (mAudioUnitSampleData.mFreeBuffers != 0) {
+        
+        unsigned char curBuffer = mAudioUnitSampleData.mCurrentBufferIdx;
+        int32_t freeBuffers = mAudioUnitSampleData.mFreeBuffers;
+
+        do {
+            --mReadingIteras;
+            
+            NSLog(@"Played frames:%d, pos:%f", mAudioUnitSampleData.mPlayedFrames,[self getCurrentPlaybackPos]);
+            
+            if (mRemainingFramesInFile != 0) {
+                
+                [self setCurrentBuffers:(curBuffer - freeBuffers)];
+                
+                if (mRemainingFramesInFile >= mFramesToReadIntoBuffer) {
+                    [self readFramesFromFile:mFramesToReadIntoBuffer];
+                }
+                else {
+                    [self readLastFramesFromFile];	
+                }
+            }
+            else if (mReadingIteras <= -mAudioUnitSampleData.mBufferCount) {
+                
+                // All of audio data buffer are outputed, stop remote i/o audio unit
+                [self stopPlayback];
+                
+                mAudioUnitSampleData.mFreeBuffers = 0;
+                
+                return;
+            }
+            else {
+                //Read all of data, while remote io does not output them all.
+				
+                signed char requestedBuffer = curBuffer - freeBuffers;
+                
+                if (requestedBuffer < 0) {
+                    requestedBuffer += mAudioUnitSampleData.mBufferCount;
+                }
+                
+				for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
+                    memset(mAudioUnitSampleData.mAudioUnitSamples[ch][requestedBuffer],0,(mFramesToReadIntoBuffer * 4));
+                }
+            }
+            
+            OSAtomicAdd32(-1,&mAudioUnitSampleData.mFreeBuffers);
+        }
+        while (--freeBuffers > 0);
+    }
+}
+
+-(void) setCurrentBuffers:(signed int)request{
+    
+    if (request < 0) {
+        request += mAudioUnitSampleData.mBufferCount;
+    }
+	
+	//Set the audio data buffer pointer
+	for (int i=0; i< mAudioBufferList->mNumberBuffers; ++i) {
+	    mAudioBufferList->mBuffers[i].mData = mAudioUnitSampleData.mAudioUnitSamples[i][request];
+	}
+	
+};
+
+-(UInt32) readFramesFromFile:(UInt32)frames{
+    
+    OSStatus status = ExtAudioFileRead (mAudioFile, &frames, mAudioBufferList);
+  
+    if (noErr == checkStatus(status,"ExtAudioFileRead failed, read audio data from file")) {
+	    mRemainingFramesInFile -= frames;
+		
+		// End of file
+		if ( 0 == frames ) {
+		    mRemainingFramesInFile = 0;
+			NSLog(@"Reach the end of file.\n");
+		}
+	}
+   
+    return frames;
+}
+
+-(void) readLastFramesFromFile{
+    
+    for (int i=0; i< mAudioBufferList->mNumberBuffers; ++i) {
+        memset(mAudioBufferList->mBuffers[i].mData,0,(mFramesToReadIntoBuffer * 4));
+    }
+    
+    [self readFramesFromFile:mRemainingFramesInFile];
+	
+    mRemainingFramesInFile = 0;
+	
+}
+
+//start playback with url
+-(id) initWithAudio:(NSString *)path{
+    
+    if (!(self=[super init])) return nil;
+    if (!path) {
+        NSLog(@"*** Error *** DlbAudioUnitPlayer init path is nil");
+        return nil;
+        
+    }
+    
+    mStarted = NO;
+	
+	mFramesToReadIntoBuffer = 16384;  //4096*4
+	
+	mAudioUnitSampleData.mBufferCount = 3;
+	mAudioUnitSampleData.mCurrentBufferIdx = 0;	
+	mAudioUnitSampleData.mFreeBuffers = mAudioUnitSampleData.mBufferCount;
+    mAudioUnitSampleData.mFramesReaded = 0;
+    mAudioUnitSampleData.mPlayedFrames = 0;
+
+	OSStatus result;
+	
+    //Get hardware sample rate that remote io audio unit needed, by default 44100.0
+    AVAudioSession * session = [AVAudioSession sharedInstance];
+    NSError *audioSessionError = nil;
+    [session setActive:YES error:&audioSessionError];
+
+
+    mHwSampleRate = session.sampleRate;
+    
+
+    result = ExtAudioFileOpenURL ((__bridge CFURLRef)[NSURL fileURLWithPath:path], &mAudioFile);
+    if (noErr != checkStatus(result,"ExtAudioFileOpenURL failed"))
+        return nil;
+    
+    //Get data format
+    UInt32 szff = sizeof(mFileFormat);
+    result = ExtAudioFileGetProperty(mAudioFile, kExtAudioFileProperty_FileDataFormat ,&szff,&mFileFormat);
+    NSLog(@"Audio channels:%d",mFileFormat.mChannelsPerFrame);
+    
+    mAudioUnitSampleData.mAudioChannels = mFileFormat.mChannelsPerFrame;
+    
+    // Check the max channels
+    if ( mAudioUnitSampleData.mAudioChannels > 8 )
+        return nil;
+    // iPhone supports only mono or stereo
+    if ( mAudioUnitSampleData.mAudioChannels > 2 )
+        mAudioUnitSampleData.mAudioChannels = 2;
+
+    //Set remote io format
+	size_t bytesPerSample = sizeof (AudioUnitSampleType);
+    mOutputFormat.mFormatID = kAudioFormatLinearPCM;
+    mOutputFormat.mFormatFlags = kAudioFormatFlagsAudioUnitCanonical;
+    mOutputFormat.mChannelsPerFrame =  mAudioUnitSampleData.mAudioChannels;
+    mOutputFormat.mFramesPerPacket = 1;
+    mOutputFormat.mBitsPerChannel = 8 * bytesPerSample;
+    mOutputFormat.mBytesPerPacket = mOutputFormat.mBytesPerFrame = bytesPerSample;
+    // should be same as the hardware
+    mOutputFormat.mSampleRate = mHwSampleRate;
+	
+	SInt64 fileFrames = 0;
+	UInt32 size = sizeof (fileFrames);
+	result = ExtAudioFileGetProperty(mAudioFile, kExtAudioFileProperty_FileLengthFrames,&size,&fileFrames);
+	if (noErr != checkStatus(result,"ExtAudioFileGetProperty failed, get file frames"))
+	    return nil;
+
+	
+	result = ExtAudioFileSetProperty(mAudioFile, kExtAudioFileProperty_ClientDataFormat,sizeof (mOutputFormat),&mOutputFormat);
+	if (noErr != checkStatus(result,"ExtAudioFileSetProperty failed, set client format"))
+	    return nil;
+										
+	SInt64 extAFSOffset = 0;
+	result = ExtAudioFileTell(mAudioFile,&extAFSOffset);
+	if (noErr != checkStatus(result,"ExtAudioFileTell failed"))
+	    return nil;
+	
+	fileFrames = fileFrames - extAFSOffset;
+	
+	if (fileFrames <= mFramesToReadIntoBuffer) {
+		mFramesToReadIntoBuffer = fileFrames;
+	}
+    
+    mAudioUnitSampleData.mFramesPerBuffer = mFramesToReadIntoBuffer;
+    
+    mAudioUnitSampleData.mFileFrames = fileFrames;
+	
+	mRemainingFramesInFile = fileFrames;
+    
+    // sample rate conversion
+    mAudioUnitSampleData.mConvertedFileFrames = fileFrames * (mHwSampleRate/mFileFormat.mSampleRate);
+
+	
+	mReadingIteras = floor(fileFrames / mFramesToReadIntoBuffer) - mAudioUnitSampleData.mBufferCount;
+	
+	//setup Remote IO Unit Player
+	[self setupRioAudioUnitPlayer];
+	
+    //Alloc the buffers
+	for (int i = 0; i < mAudioUnitSampleData.mAudioChannels; ++i) {
+        mAudioUnitSampleData.mAudioUnitSamples[i] = malloc(mAudioUnitSampleData.mBufferCount * sizeof(AudioUnitSampleType *));
+    }
+	
+	//alloc the audio sample buffer memory
+	for (int i = 0; i < mAudioUnitSampleData.mBufferCount; ++i) {
+        for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
+		    mAudioUnitSampleData.mAudioUnitSamples[ch][i] = calloc (mFramesToReadIntoBuffer, sizeof (AudioUnitSampleType));
+        }
+	}
+    
+    mAudioBufferList = malloc(sizeof(AudioBufferList) +  mAudioUnitSampleData.mAudioChannels * sizeof(AudioBuffer));
+    mAudioBufferList->mNumberBuffers = mAudioUnitSampleData.mAudioChannels;
+    for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
+        mAudioBufferList->mBuffers[ch].mData = mAudioUnitSampleData.mAudioUnitSamples[ch][0];
+        mAudioBufferList->mBuffers[ch].mNumberChannels = mAudioUnitSampleData.mAudioChannels;
+        mAudioBufferList->mBuffers[ch].mDataByteSize = mFramesToReadIntoBuffer * sizeof (AudioUnitSampleType);
+        
+    }
+	
+	
+	[self startRioAudioUnitPlayer];
+	
+    return self;
+    
+}
+
+-(Float32)getCurrentPlaybackPos{
+
+   return mAudioUnitSampleData.mPlayedFrames/mHwSampleRate;
+    
+}
+
+-(Float32)getFileDuration{
+    return mAudioUnitSampleData.mFileFrames /mFileFormat.mSampleRate;
+}
+
+-(void)setupRioAudioUnitPlayer{
+	
+	AudioComponentDescription rioUnitDesc;
+	rioUnitDesc.componentType = kAudioUnitType_Output;
+	rioUnitDesc.componentSubType = kAudioUnitSubType_RemoteIO;
+	rioUnitDesc.componentManufacturer = kAudioUnitManufacturer_Apple;
+	rioUnitDesc.componentFlags = 0;
+	rioUnitDesc.componentFlagsMask = 0;
+
+	AudioComponent comp = AudioComponentFindNext(NULL, &rioUnitDesc);
+
+	if (noErr != checkStatus(AudioComponentInstanceNew(comp, &mRioAudioUnit),"AudioComponentInstanceNew failed, new RIO Unit"))
+	    return;
+	
+	// Enable IO for playback
+	UInt32 output = 1;
+	OSStatus result = AudioUnitSetProperty(mRioAudioUnit, 
+								  kAudioOutputUnitProperty_EnableIO, 
+								  kAudioUnitScope_Output, 
+								  0,
+								  &output, 
+								  sizeof(output));
+	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, enable output for RemoteIO Unit"))
+	    return;
+		
+	// Set up the playback  callback
+	AURenderCallbackStruct playCallbackStru;
+	playCallbackStru.inputProc = playbackCallback;
+	playCallbackStru.inputProcRefCon = &mAudioUnitSampleData;
+	
+	result = AudioUnitSetProperty(mRioAudioUnit, 
+								  kAudioUnitProperty_SetRenderCallback, 
+								  kAudioUnitScope_Global, 
+								  0,
+								  &playCallbackStru, 
+								  sizeof(playCallbackStru));
+	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, set up RemoteIO callback function"))
+	    return;
+	
+	result = AudioUnitSetProperty(mRioAudioUnit, 
+                                kAudioUnitProperty_StreamFormat, 
+                                kAudioUnitScope_Input, 
+                                0, 
+                                &mOutputFormat, 
+                                sizeof(mOutputFormat));
+								
+	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, set up RemoteIO stream format"))
+	    return;	
+		
+	result = AudioUnitInitialize(mRioAudioUnit);
+	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, initialize RemoteIO Unit"))
+	    return;
+		
+	
+}
+
+-(void)startRioAudioUnitPlayer{
+
+    void (^cycleFillBufferBlock)(void) = ^(void){
+            [self cycleFillBufferFromFile];
+            };
+	
+    mDispatchQueue = dispatch_queue_create("com.dolby.audiounitplayer.dispathqueue", NULL);
+	
+	mDispatchSourceTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, mDispatchQueue);
+    dispatch_source_set_timer(mDispatchSourceTimer, dispatch_time(DISPATCH_TIME_NOW, 0), 0.15 * NSEC_PER_SEC, 0.1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(mDispatchSourceTimer,cycleFillBufferBlock);
+    dispatch_resume(mDispatchSourceTimer);
+        
+    AudioOutputUnitStart(mRioAudioUnit);
+    
+    mStarted = YES;
+
+}
+
+-(void)stopPlayback{
+    
+    if (!mStarted)
+        return;
+	
+    mStarted = NO;
+    
+	AudioOutputUnitStop(mRioAudioUnit);
+    
+    [[AVAudioSession sharedInstance] setActive:NO error:nil];
+
+    dispatch_source_cancel(mDispatchSourceTimer);
+    
+    
+    for (int i = 0; i < mAudioUnitSampleData.mBufferCount; ++i) {
+        for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
+            free(mAudioUnitSampleData.mAudioUnitSamples[ch][i]);
+        }
+    }
+
+    
+    for (int i = 0; i < mAudioUnitSampleData.mAudioChannels; ++i) {
+        free(mAudioUnitSampleData.mAudioUnitSamples[i] );
+    }
+	
+	if (mAudioBufferList != NULL) {
+		free(mAudioBufferList);
+        mAudioBufferList = 0;
+    }
+	
+}
+
+-(void)dealloc{
+    
+    NSLog(@"DLBAudioUnitPlayer dealloc.");
+    
+    if (mStarted ) {
+        [self stopPlayback];
+    }
+    
+}
+
+@end
