@@ -1,57 +1,72 @@
+//
+//  DLBAudioQueuePlayer.m
+//  TestApp
+//
+//  Created by Tianlei on 2/18/16.
+//  Copyright © 2016 Dolby. All rights reserved.
+//
+
 #import "DLBAudioQueuePlayer.h"
 
 static UInt32 gBufferSizeBytes=0x10000;
 
 @implementation DLBAudioQueuePlayer
 
-//callback function for AudioQueueNewOutput
+
 void AQOutputCallback(void * inUserData,
                       AudioQueueRef outAQ,
                       AudioQueueBufferRef outBuffer) {
-                      
-    //initial audio queue service with user data
+    
     DLBAudioQueuePlayer *player = (__bridge DLBAudioQueuePlayer*)inUserData;
+    
+    if (!player->mStarted)
+        return;
     
     
     UInt32 numBytes = gBufferSizeBytes;
     UInt32 numPackets=player->mNumPacketsToRead;
     
-    //read packet from file
     OSStatus status = AudioFileReadPacketData(player->mAudioFile, NO, &numBytes, player->mPacketDescs, player->mPacketIndex,&numPackets, outBuffer->mAudioData);
     
     if (status != noErr && status != kAudioFileEndOfFileError) {
         return;
     }
     
+    NSLog(@"Current pos:%f",[player getCurrentPlaybackPos]);
+    
     if (numPackets>0) {
         
         outBuffer->mAudioDataByteSize=numBytes;
         
-        //send packet to audio queue
         status = AudioQueueEnqueueBuffer(outAQ, outBuffer, (player->mPacketDescs ? numPackets : 0 ), player->mPacketDescs);
         if (status != noErr) {
             NSLog(@"*** Error *** DLBAudioQueuePlayer - AudioQueueEnqueueBuffer failed,status=%d", (int)status);
         }
         
         player->mPacketIndex += numPackets;
+        
     }
     
-    //handle exceptions
     if (numPackets == 0 || status == kAudioFileEndOfFileError) {
         AudioQueueStop(outAQ,false);
         AudioFileClose(player->mAudioFile);
-    }      
+        player->mEnd = YES;
+    }
+    
+    
 }
 
--(void)stopPlayback{    
+-(void)stopPlayback{
+    
+    
     if (!mStarted)
         return;
     
     mStarted = NO;
+    mError = -0;
     
     dispatch_queue_t sq = dispatch_queue_create("com.dolby.DLBAudioQueuePlayer", NULL);
     
-    //stop playback asynchronously
     dispatch_async(sq, ^{
         AudioQueueDispose(mQueue, true);
         AudioFileClose(mAudioFile);
@@ -65,12 +80,12 @@ void AQOutputCallback(void * inUserData,
     });
 }
 
-//start playback with url
 -(id) initWithAudio:(NSString *)path{
     
     if (!(self=[super init])) return nil;
     if (!path) {
         NSLog(@"*** Error *** DLBAudioQueuePlayer init path is nil");
+        mError = -1;
         return nil;
         
     }
@@ -81,11 +96,14 @@ void AQOutputCallback(void * inUserData,
     OSStatus status;
     
     mStarted = NO;
+    mEnd = NO;
+    mError = 0;
     
     //Open the audio file
     status=AudioFileOpenURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], kAudioFileReadPermission, 0, &mAudioFile);
     if (status != noErr) {
         NSLog(@"*** Error *** DLBAudioQueuePlayer could not open audio file. Path was: %@", path);
+        mError = -1;
         return nil;
     }
     
@@ -93,12 +111,36 @@ void AQOutputCallback(void * inUserData,
     size = sizeof(mDataFormat);
     AudioFileGetProperty(mAudioFile, kAudioFilePropertyDataFormat, &size, &mDataFormat);
     
+    NSTimeInterval sec;
+    size = sizeof(sec);
+    if (noErr == AudioFileGetProperty(mAudioFile, kAudioFilePropertyEstimatedDuration, &size, &sec)) {
+        mDuration = [[NSNumber alloc] initWithDouble:sec];
+    }
+    NSLog(@"File duration:%f",[self getFileDuration]);
+    
+    
     //Create Audio Queue
     AudioQueueNewOutput(&mDataFormat, AQOutputCallback, (__bridge void *)(self),
                         nil, nil, 0, &mQueue);
     
+    //Check data format
+    NSLog(@"mDataFormat.mFormatID=%d",(unsigned int)mDataFormat.mFormatID);
+    
+    switch (mDataFormat.mFormatID) {
+        case kAudioFormatAC3:
+            NSLog(@"is DD file");
+            break;
+        case kAudioFormatEnhancedAC3:
+            NSLog(@"is DDP file");
+            break;
+        default:
+            break;
+    }
+    
+    NSLog(@"channels:%d",(unsigned int)mDataFormat.mChannelsPerFrame);
+    
+    //VBR
     if (mDataFormat.mBytesPerPacket==0 || mDataFormat.mFramesPerPacket==0) {
-        //in VBR case
         size=sizeof(maxPacketSize);
         AudioFileGetProperty(mAudioFile, kAudioFilePropertyPacketSizeUpperBound, &size, &maxPacketSize);
         if (maxPacketSize > gBufferSizeBytes) {
@@ -106,11 +148,16 @@ void AQOutputCallback(void * inUserData,
         }
         
         mNumPacketsToRead = gBufferSizeBytes/maxPacketSize;
-        mPacketDescs=malloc(sizeof(AudioStreamPacketDescription)*mNumPacketsToRead);        
+        mPacketDescs=malloc(sizeof(AudioStreamPacketDescription)*mNumPacketsToRead);
+        
+        NSLog(@"file Is VBR");
+        
     }else {
-        //in CBR case
+        //CBR
         mNumPacketsToRead= gBufferSizeBytes/mDataFormat.mBytesPerPacket;
         mPacketDescs=NULL;
+        
+        NSLog(@"file is CBR");
     }
     
     //Set Magic Cookie
@@ -125,7 +172,8 @@ void AQOutputCallback(void * inUserData,
     //Set audio channel layout
     if (mDataFormat.mChannelsPerFrame > 2 ) {
         UInt32 sz = sizeof(UInt32);
-        status = AudioFileGetProperty(mAudioFile, kAudioFilePropertyChannelLayout, &sz, NULL);
+        AudioChannelLayout al;
+        status = AudioFileGetProperty(mAudioFile, kAudioFilePropertyChannelLayout, &sz, &al);
         if (noErr == status && sz > 0) {
             AudioChannelLayout *acl = malloc(sz);
             AudioFileGetProperty(mAudioFile, kAudioFilePropertyChannelLayout, &sz,acl);
@@ -134,7 +182,9 @@ void AQOutputCallback(void * inUserData,
         }
     }
     
-    //malloc buffer and read packages
+    mStarted = YES;
+    
+    // malloc buffer and read packages
     mPacketIndex=0;
     for (int i=0; i<NUM_BUFFERS; i++) {
         AudioQueueAllocateBuffer(mQueue, gBufferSizeBytes, &mBuffers[i]);
@@ -147,12 +197,39 @@ void AQOutputCallback(void * inUserData,
     
     AudioQueueStart(mQueue, NULL);
     
-    mStarted = YES;
-    
+
     return self;
 }
 
-//destruction
+-(int8_t)getPlayingStatus{
+    
+    if (mError < 0) {
+        return mError;
+    }
+    
+    return mStarted;
+}
+
+-(Float32)getCurrentPlaybackPos{
+    
+    AudioTimeStamp ts;
+    
+    if (mEnd) {
+        return [self getFileDuration];
+    }
+    
+    if (noErr == AudioQueueGetCurrentTime(mQueue, NULL, &ts,NULL)) {
+        return ts.mSampleTime / mDataFormat.mSampleRate;
+    }
+    
+    return 0.0;
+    
+}
+
+-(Float32)getFileDuration{
+    return mDuration.doubleValue;
+}
+
 -(void)dealloc{
     
     NSLog(@"DLBAudioQueuePlayer dealloced!");

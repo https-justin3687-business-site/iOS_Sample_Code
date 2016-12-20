@@ -1,3 +1,11 @@
+//
+//  DlbAudioUnitPlayer.m
+//  testApp
+//
+//  Created by Gan, Lei on 1/13/16.
+//  Copyright © 2016 Gan, Lei. All rights reserved.
+//
+
 #import "DLBAudioUnitPlayer.h"
 #import <libkern/OSAtomic.h>
 #import <AVFoundation/AVFoundation.h>
@@ -18,9 +26,6 @@ static OSStatus playbackCallback (
     
     if (audioSampleData->mFreeBuffers == audioSampleData->mBufferCount )
         return noErr;
-    if (audioSampleData->mPlayedFrames >= audioSampleData->mConvertedFileFrames)
-        return noErr;
-    
 		
     audioSampleData->mCallbackFrames = inNumberFrames;
 	
@@ -29,12 +34,12 @@ static OSStatus playbackCallback (
         
         if (audioSampleData->mFramesPerBuffer < (audioSampleData->mFramesReaded + inNumberFrames)) {
             
-            UInt32 frameOffset = audioSampleData->mFramesPerBuffer - audioSampleData->mFramesReaded;
+            UInt64 frameOffset = audioSampleData->mFramesPerBuffer - audioSampleData->mFramesReaded;
             
             for (UInt32 i = 0; i < frameOffset; ++i) {
                 
                 for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
-                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+                    ((SInt32 *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
                 }
                
                 
@@ -49,10 +54,10 @@ static OSStatus playbackCallback (
             OSAtomicAdd32(1,&audioSampleData->mFreeBuffers);
             
             UInt32 continueSampleNumber = 0;
-            for (UInt32 i = frameOffset; i < inNumberFrames; ++i) {
+            for (UInt64 i = frameOffset; i < inNumberFrames; ++i) {
                 
                 for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
-                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][continueSampleNumber];
+                    ((SInt32 *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][continueSampleNumber];
                 }
                 
                 ++continueSampleNumber;
@@ -67,7 +72,7 @@ static OSStatus playbackCallback (
             for (UInt32 i = 0; i < inNumberFrames; ++i) {
                 
                 for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
-                    ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+                    ((SInt32 *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
                 }
  
                 ++audioSampleData->mFramesReaded;
@@ -80,7 +85,7 @@ static OSStatus playbackCallback (
         for (UInt32 i = 0; i < audioSampleData->mCallbackFrames; ++i) {
             
             for (int ch=0; ch < audioSampleData->mAudioChannels; ++ch) {
-                ((AudioUnitSampleType *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
+                ((SInt32 *)(ioData->mBuffers[ch].mData))[i] = audioSampleData->mAudioUnitSamples[ch][audioSampleData->mCurrentBufferIdx][audioSampleData->mFramesReaded];
             }
             
             ++audioSampleData->mFramesReaded;
@@ -98,8 +103,14 @@ static OSStatus playbackCallback (
         audioSampleData->mFramesReaded = 0;
     }
     
+    //   if (audioSampleData->mPlayedFrames > audioSampleData->mConvertedFileFrames) {
+    //       return noErr;
+    //   }
+    
     return noErr;
 }
+
+
 
 OSStatus checkStatus(OSStatus err, const char * msg)
 {
@@ -134,13 +145,11 @@ OSStatus checkStatus(OSStatus err, const char * msg)
         do {
             --mReadingIteras;
             
-            NSLog(@"Played frames:%d, pos:%f", mAudioUnitSampleData.mPlayedFrames,[self getCurrentPlaybackPos]);
-            
             if (mRemainingFramesInFile != 0) {
                 
                 [self setCurrentBuffers:(curBuffer - freeBuffers)];
                 
-                if (mRemainingFramesInFile >= mFramesToReadIntoBuffer) {
+                if (mRemainingFramesInFile >= (UInt32)mFramesToReadIntoBuffer) {
                     [self readFramesFromFile:mFramesToReadIntoBuffer];
                 }
                 else {
@@ -191,6 +200,9 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 
 -(UInt32) readFramesFromFile:(UInt32)frames{
     
+    if (!mStarted)
+        return 0;
+    
     OSStatus status = ExtAudioFileRead (mAudioFile, &frames, mAudioBufferList);
   
     if (noErr == checkStatus(status,"ExtAudioFileRead failed, read audio data from file")) {
@@ -208,27 +220,32 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 
 -(void) readLastFramesFromFile{
     
+    if (!mStarted)
+        return;
+    
     for (int i=0; i< mAudioBufferList->mNumberBuffers; ++i) {
         memset(mAudioBufferList->mBuffers[i].mData,0,(mFramesToReadIntoBuffer * 4));
     }
     
-    [self readFramesFromFile:mRemainingFramesInFile];
+    [self readFramesFromFile:(UInt32)mRemainingFramesInFile];
 	
     mRemainingFramesInFile = 0;
 	
 }
 
-//start playback with url
+
 -(id) initWithAudio:(NSString *)path{
     
     if (!(self=[super init])) return nil;
     if (!path) {
         NSLog(@"*** Error *** DlbAudioUnitPlayer init path is nil");
+        mError = -1;
         return nil;
         
     }
     
     mStarted = NO;
+    mError = 0;
 	
 	mFramesToReadIntoBuffer = 16384;  //4096*4
 	
@@ -250,13 +267,15 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     
 
     result = ExtAudioFileOpenURL ((__bridge CFURLRef)[NSURL fileURLWithPath:path], &mAudioFile);
-    if (noErr != checkStatus(result,"ExtAudioFileOpenURL failed"))
+    if (noErr != checkStatus(result,"ExtAudioFileOpenURL failed")) {
+        mError = -1;
         return nil;
+    }
     
     //Get data format
     UInt32 szff = sizeof(mFileFormat);
     result = ExtAudioFileGetProperty(mAudioFile, kExtAudioFileProperty_FileDataFormat ,&szff,&mFileFormat);
-    NSLog(@"Audio channels:%d",mFileFormat.mChannelsPerFrame);
+    NSLog(@"Audio channels:%d",(unsigned int)mFileFormat.mChannelsPerFrame);
     
     mAudioUnitSampleData.mAudioChannels = mFileFormat.mChannelsPerFrame;
     
@@ -268,9 +287,9 @@ OSStatus checkStatus(OSStatus err, const char * msg)
         mAudioUnitSampleData.mAudioChannels = 2;
 
     //Set remote io format
-	size_t bytesPerSample = sizeof (AudioUnitSampleType);
+	UInt32 bytesPerSample = sizeof (SInt32);
     mOutputFormat.mFormatID = kAudioFormatLinearPCM;
-    mOutputFormat.mFormatFlags = kAudioFormatFlagsAudioUnitCanonical;
+    mOutputFormat.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagsNativeEndian | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved;//kAudioFormatFlagsAudioUnitCanonical;
     mOutputFormat.mChannelsPerFrame =  mAudioUnitSampleData.mAudioChannels;
     mOutputFormat.mFramesPerPacket = 1;
     mOutputFormat.mBitsPerChannel = 8 * bytesPerSample;
@@ -281,23 +300,29 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 	SInt64 fileFrames = 0;
 	UInt32 size = sizeof (fileFrames);
 	result = ExtAudioFileGetProperty(mAudioFile, kExtAudioFileProperty_FileLengthFrames,&size,&fileFrames);
-	if (noErr != checkStatus(result,"ExtAudioFileGetProperty failed, get file frames"))
-	    return nil;
+    if (noErr != checkStatus(result,"ExtAudioFileGetProperty failed, get file frames")) {
+	     mError = -1;
+        return nil;
+    }
 
 	
 	result = ExtAudioFileSetProperty(mAudioFile, kExtAudioFileProperty_ClientDataFormat,sizeof (mOutputFormat),&mOutputFormat);
-	if (noErr != checkStatus(result,"ExtAudioFileSetProperty failed, set client format"))
-	    return nil;
-										
+    if (noErr != checkStatus(result,"ExtAudioFileSetProperty failed, set client format")) {
+	    mError = -1;
+        return nil;
+    }
+    
 	SInt64 extAFSOffset = 0;
 	result = ExtAudioFileTell(mAudioFile,&extAFSOffset);
-	if (noErr != checkStatus(result,"ExtAudioFileTell failed"))
-	    return nil;
+    if (noErr != checkStatus(result,"ExtAudioFileTell failed")) {
+	    mError = -1;
+        return nil;
+    }
 	
 	fileFrames = fileFrames - extAFSOffset;
 	
 	if (fileFrames <= mFramesToReadIntoBuffer) {
-		mFramesToReadIntoBuffer = fileFrames;
+		mFramesToReadIntoBuffer = (UInt32)fileFrames;
 	}
     
     mAudioUnitSampleData.mFramesPerBuffer = mFramesToReadIntoBuffer;
@@ -313,17 +338,17 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 	mReadingIteras = floor(fileFrames / mFramesToReadIntoBuffer) - mAudioUnitSampleData.mBufferCount;
 	
 	//setup Remote IO Unit Player
-	[self setupRioAudioUnitPlayer];
+	mError = [self setupRioAudioUnitPlayer];
 	
     //Alloc the buffers
 	for (int i = 0; i < mAudioUnitSampleData.mAudioChannels; ++i) {
-        mAudioUnitSampleData.mAudioUnitSamples[i] = malloc(mAudioUnitSampleData.mBufferCount * sizeof(AudioUnitSampleType *));
+        mAudioUnitSampleData.mAudioUnitSamples[i] = malloc(mAudioUnitSampleData.mBufferCount * sizeof(SInt32 *));
     }
 	
 	//alloc the audio sample buffer memory
 	for (int i = 0; i < mAudioUnitSampleData.mBufferCount; ++i) {
         for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
-		    mAudioUnitSampleData.mAudioUnitSamples[ch][i] = calloc (mFramesToReadIntoBuffer, sizeof (AudioUnitSampleType));
+		    mAudioUnitSampleData.mAudioUnitSamples[ch][i] = calloc (mFramesToReadIntoBuffer, sizeof (SInt32));
         }
 	}
     
@@ -332,7 +357,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     for (int ch = 0; ch < mAudioUnitSampleData.mAudioChannels; ++ch) {
         mAudioBufferList->mBuffers[ch].mData = mAudioUnitSampleData.mAudioUnitSamples[ch][0];
         mAudioBufferList->mBuffers[ch].mNumberChannels = mAudioUnitSampleData.mAudioChannels;
-        mAudioBufferList->mBuffers[ch].mDataByteSize = mFramesToReadIntoBuffer * sizeof (AudioUnitSampleType);
+        mAudioBufferList->mBuffers[ch].mDataByteSize = mFramesToReadIntoBuffer * sizeof (SInt32);
         
     }
 	
@@ -343,8 +368,21 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     
 }
 
+-(int8_t)getPlayingStatus{
+    
+    if (mError < 0) {
+        return mError;
+    }
+    
+    return mStarted;
+}
+
 -(Float32)getCurrentPlaybackPos{
 
+   if (mAudioUnitSampleData.mPlayedFrames >= mAudioUnitSampleData.mConvertedFileFrames) {
+       return [self getFileDuration];
+   }
+    
    return mAudioUnitSampleData.mPlayedFrames/mHwSampleRate;
     
 }
@@ -353,7 +391,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     return mAudioUnitSampleData.mFileFrames /mFileFormat.mSampleRate;
 }
 
--(void)setupRioAudioUnitPlayer{
+-(int8_t)setupRioAudioUnitPlayer{
 	
 	AudioComponentDescription rioUnitDesc;
 	rioUnitDesc.componentType = kAudioUnitType_Output;
@@ -365,7 +403,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 	AudioComponent comp = AudioComponentFindNext(NULL, &rioUnitDesc);
 
 	if (noErr != checkStatus(AudioComponentInstanceNew(comp, &mRioAudioUnit),"AudioComponentInstanceNew failed, new RIO Unit"))
-	    return;
+	    return -1;
 	
 	// Enable IO for playback
 	UInt32 output = 1;
@@ -376,7 +414,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 								  &output, 
 								  sizeof(output));
 	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, enable output for RemoteIO Unit"))
-	    return;
+	    return -1;
 		
 	// Set up the playback  callback
 	AURenderCallbackStruct playCallbackStru;
@@ -390,7 +428,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 								  &playCallbackStru, 
 								  sizeof(playCallbackStru));
 	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, set up RemoteIO callback function"))
-	    return;
+	    return -1;
 	
 	result = AudioUnitSetProperty(mRioAudioUnit, 
                                 kAudioUnitProperty_StreamFormat, 
@@ -400,12 +438,13 @@ OSStatus checkStatus(OSStatus err, const char * msg)
                                 sizeof(mOutputFormat));
 								
 	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, set up RemoteIO stream format"))
-	    return;	
+	    return -1;
 		
 	result = AudioUnitInitialize(mRioAudioUnit);
 	if (noErr != checkStatus(result,"AudioUnitSetProperty failed, initialize RemoteIO Unit"))
-	    return;
-		
+	    return -1;
+    
+    return 0;
 	
 }
 
