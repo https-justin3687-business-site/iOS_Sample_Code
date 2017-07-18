@@ -21,10 +21,44 @@ AVAudioPlayer *audioplayer;
     }
     
     mError = 0;
+    NSError *error = nil;
     
     audioplayer = [[AVAudioPlayer alloc] initWithContentsOfURL:[NSURL fileURLWithPath:path] error:nil];
-    //audioplayer.delegate = self;
-    //[audioplayer setNumberOfLoops:0];
+    
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    NSUInteger outputs = session.maximumOutputNumberOfChannels;        //query the number of channels the hardware has
+    //NSLog(@"output channel:%lu", (unsigned long)outputs);
+    
+    NSUInteger source = audioplayer.numberOfChannels;       //query the number of channels in source audio
+    //NSLog(@"source channel:%lu", (unsigned long)source);
+    
+    if (outputs == 2 || outputs == 1) {     // 2 for steoro, 1 for mono
+        [session setPreferredOutputNumberOfChannels:outputs error:&error];
+    }
+    else if (outputs == 6) {
+        if (source < 6) {
+            [session setPreferredOutputNumberOfChannels:source error:&error];
+        } else {
+            [session setPreferredOutputNumberOfChannels:outputs error:&error];
+        }
+    }
+    else if (outputs == 8) {
+        if (source < 8) {
+            [session setPreferredOutputNumberOfChannels:source error:&error];
+        } else {
+            [session setPreferredOutputNumberOfChannels:outputs error:&error];
+        }
+    }
+    else {
+        [session setPreferredOutputNumberOfChannels:outputs error:&error];
+    }
+    
+    bool success = [session setActive:YES error:&error];
+    NSAssert(success, @"Error setting AVAudioSession active! %@", [error localizedDescription]);
+    
+    //NSUInteger input = session.inputNumberOfChannels;
+    //NSLog(@"output channel:%lu", (unsigned long)input);   //always return 0
+
     [audioplayer play];
     
     mStarted = YES;
@@ -69,7 +103,7 @@ AVAudioPlayer *audioplayer;
     
     mStarted = NO;
     mEnd = YES;
-    
+    NSLog(@"stopPlayback");
     [audioplayer stop];
 
 }

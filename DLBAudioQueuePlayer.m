@@ -6,6 +6,7 @@
 //  Copyright © 2016 Dolby. All rights reserved.
 //
 
+#import <AVFoundation/AVFoundation.h>
 #import "DLBAudioQueuePlayer.h"
 
 static UInt32 gBufferSizeBytes=0x10000;
@@ -100,7 +101,7 @@ void AQOutputCallback(void * inUserData,
     mError = 0;
     
     //Open the audio file
-    status=AudioFileOpenURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], kAudioFileReadPermission, 0, &mAudioFile);
+    status = AudioFileOpenURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], kAudioFileReadPermission, 0, &mAudioFile);
     if (status != noErr) {
         NSLog(@"*** Error *** DLBAudioQueuePlayer could not open audio file. Path was: %@", path);
         mError = -1;
@@ -110,6 +111,8 @@ void AQOutputCallback(void * inUserData,
     //Get audio stream data format
     size = sizeof(mDataFormat);
     AudioFileGetProperty(mAudioFile, kAudioFilePropertyDataFormat, &size, &mDataFormat);
+    NSLog(@"Input channels:%d",(unsigned int)mDataFormat.mChannelsPerFrame);
+    
     
     NSTimeInterval sec;
     size = sizeof(sec);
@@ -137,7 +140,6 @@ void AQOutputCallback(void * inUserData,
             break;
     }
     
-    NSLog(@"channels:%d",(unsigned int)mDataFormat.mChannelsPerFrame);
     
     //VBR
     if (mDataFormat.mBytesPerPacket==0 || mDataFormat.mFramesPerPacket==0) {
@@ -169,6 +171,28 @@ void AQOutputCallback(void * inUserData,
         free(cookie);
     }
     
+    //Set AudioQueueChannelAssignment
+    AVAudioSessionRouteDescription* route = [[AVAudioSession sharedInstance] currentRoute];
+    for (AVAudioSessionPortDescription* outport in [route outputs])
+    {
+        NSLog(@"PortName=%@,Type=%@,UID=%@,Channels=%@", outport.portName, outport.portType, outport.UID, outport.channels);
+        AudioQueueChannelAssignment *outchannel = malloc(sizeof(AudioQueueChannelAssignment));
+        size = sizeof(outchannel);
+        outchannel->mDeviceUID = (__bridge CFStringRef _Nonnull)(outport.UID);
+        
+        for (AVAudioSessionChannelDescription* channels in [outport channels])
+        {
+            outchannel->mChannelNumber = channels.channelNumber; //mDataFormat.mChannelsPerFrame;
+        }
+        
+        NSLog(@"UID=%@,Numbers=%u", outchannel->mDeviceUID, (unsigned int)outchannel->mChannelNumber);
+        status = AudioQueueSetProperty(mQueue, kAudioQueueProperty_ChannelAssignments, outchannel, size);
+        if (status != noErr) {
+            NSLog(@"kAudioQueueProperty_ChannelAssignments setting error");
+        }
+    }
+    
+
     //Set audio channel layout
     if (mDataFormat.mChannelsPerFrame > 2 ) {
         UInt32 sz = sizeof(UInt32);
@@ -181,7 +205,7 @@ void AQOutputCallback(void * inUserData,
             free(acl);
         }
     }
-    
+
     mStarted = YES;
     
     // malloc buffer and read packages

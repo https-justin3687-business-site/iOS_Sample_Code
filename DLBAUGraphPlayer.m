@@ -167,7 +167,7 @@ static OSStatus renderNotification(void *inRefCon, AudioUnitRenderActionFlags *i
     if (noErr != checkError(AUGraphStart(mGraph), "AUGraphStart failed"))
         return -1;
 
-     mStarted = YES;
+    mStarted = YES;
     
     return 0;
 }
@@ -184,6 +184,14 @@ static OSStatus renderNotification(void *inRefCon, AudioUnitRenderActionFlags *i
     
     mStarted = NO;
     
+    NSError *error = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setPreferredOutputNumberOfChannels:8 error:&error];
+    bool success = [session setActive:YES error:&error];
+    NSAssert(success, @"Error setting AVAudioSession active! %@", [error localizedDescription]);
+    
+    NSUInteger channels = session.maximumOutputNumberOfChannels;
+    NSLog(@"channels:%lu", (unsigned long)channels);
     mError = [self startPlayback:path];
     
     return self;

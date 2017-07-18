@@ -261,8 +261,9 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     AVAudioSession * session = [AVAudioSession sharedInstance];
     NSError *audioSessionError = nil;
     [session setActive:YES error:&audioSessionError];
+    
 
-
+    mHWChannels = session.maximumOutputNumberOfChannels;
     mHwSampleRate = session.sampleRate;
     
 
@@ -275,10 +276,11 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     //Get data format
     UInt32 szff = sizeof(mFileFormat);
     result = ExtAudioFileGetProperty(mAudioFile, kExtAudioFileProperty_FileDataFormat ,&szff,&mFileFormat);
-    NSLog(@"Audio channels:%d",(unsigned int)mFileFormat.mChannelsPerFrame);
+    NSLog(@"AudioFile Channels:%d",(unsigned int)mFileFormat.mChannelsPerFrame);
     
     mAudioUnitSampleData.mAudioChannels = mFileFormat.mChannelsPerFrame;
     
+
     // Check the max channels
     if ( mAudioUnitSampleData.mAudioChannels > 8 )
         return nil;
@@ -286,6 +288,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
     if ( mAudioUnitSampleData.mAudioChannels > 2 )
         mAudioUnitSampleData.mAudioChannels = 2;
 
+    
     //Set remote io format
 	UInt32 bytesPerSample = sizeof (SInt32);
     mOutputFormat.mFormatID = kAudioFormatLinearPCM;
@@ -360,8 +363,7 @@ OSStatus checkStatus(OSStatus err, const char * msg)
         mAudioBufferList->mBuffers[ch].mDataByteSize = mFramesToReadIntoBuffer * sizeof (SInt32);
         
     }
-	
-	
+    
 	[self startRioAudioUnitPlayer];
 	
     return self;
@@ -405,9 +407,59 @@ OSStatus checkStatus(OSStatus err, const char * msg)
 	if (noErr != checkStatus(AudioComponentInstanceNew(comp, &mRioAudioUnit),"AudioComponentInstanceNew failed, new RIO Unit"))
 	    return -1;
 	
+    //Query the StreamFormat from the output
+    AudioStreamBasicDescription mFormat;
+    UInt32 size = sizeof(mFormat);
+    OSStatus result = AudioUnitGetProperty(mRioAudioUnit,
+                                           kAudioUnitProperty_StreamFormat,
+                                           kAudioUnitScope_Output,
+                                           0,
+                                           &mFormat,
+                                           &size);
+    if (noErr != checkStatus(result,"Failed to set kAudioUnitProperty_StreamFormat"))
+        return -1;
+    
+    NSLog(@"ChannelsPerFrame=%u", (unsigned int)mFormat.mChannelsPerFrame);
+    mOutputFormat.mChannelsPerFrame =  mFormat.mChannelsPerFrame;
+    
+    if (mHWChannels > 2) {
+        NSLog(@"mHWChannels:%lu", (unsigned long)mHWChannels);
+        SInt32 *channelMap =NULL;
+        UInt32 numOfChannels = mHWChannels;
+        UInt32 mapSize = numOfChannels *sizeof(SInt32);
+
+        channelMap = (SInt32 *)malloc(mapSize);
+
+        //for each channel of desired input, map the channel from the device's output channel.
+        for(UInt32 i=0; i<numOfChannels; i++)
+        {
+                channelMap[i] = -1;
+        }
+
+        //channelMap[0] = 0;
+        //channelMap[1] = 1;
+        //channelMap[2] = 2;
+        //channelMap[3] = 3;
+        //channelMap[4] = 4;
+        //channelMap[5] = 5;
+        //channelMap[6] = 6;
+        //channelMap[7] = 5;
+        
+        result = AudioUnitSetProperty(mRioAudioUnit,
+                                kAudioOutputUnitProperty_ChannelMap,
+                                kAudioUnitScope_Input,
+                                1,
+                                channelMap,
+                                mapSize);
+        if (noErr != checkStatus(result,"Failed to set kAudioOutputUnitProperty_ChannelMap"))
+            return -1;
+        
+        free(channelMap);
+    }
+    
 	// Enable IO for playback
 	UInt32 output = 1;
-	OSStatus result = AudioUnitSetProperty(mRioAudioUnit, 
+	result = AudioUnitSetProperty(mRioAudioUnit,
 								  kAudioOutputUnitProperty_EnableIO, 
 								  kAudioUnitScope_Output, 
 								  0,
